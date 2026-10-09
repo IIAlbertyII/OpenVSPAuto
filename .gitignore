@@ -1,0 +1,10 @@
+
+# Ignorar todo por defecto
+/*
+
+# Permitir archivos Python y Markdown en la raíz
+!/*.py
+!/*.md
+
+# Mantener este archivo de configuración
+!/.gitignore
