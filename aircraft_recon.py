@@ -15,7 +15,7 @@ Commands:
   history | undo | checkout N | diff [A] [B]
 Coordinates: X nose->tail, Y right, Z up (OpenVSP native). Units: m, deg.
 """
-import argparse, glob, json, os, re, shutil, sys, tempfile, time, platform
+import argparse, glob, json, os, re, shutil, sys, tempfile, time, platform, types
 from pathlib import Path
 import numpy as np
 HOME = Path(__file__).resolve().parent / "project"
@@ -68,7 +68,18 @@ ALIGN = {"top": ("min", "center"), "side": ("min", "min"), "front": ("center", "
 DEFAULT_W = {"top": 1.0, "side": 1.0, "front": 1.0}
 
 _TESS_SCALE_CACHE = None
-_FAST = False          # True while optimising/comparing: coarse mesh (fast); committed models use the persisted scale
+_FAST = False
+_AIRFRAME_ONLY = False   # True: evaluate/build the bare airframe (no nacelles, fairings, gear, details)          # True while optimising/comparing: coarse mesh (fast); committed models use the persisted scale
+
+
+class airframe_only:
+    """Phase 1 works on the airframe alone, against masks without engines."""
+    def __enter__(self):
+        global _AIRFRAME_ONLY
+        self.prev, _AIRFRAME_ONLY = _AIRFRAME_ONLY, True
+    def __exit__(self, *exc):
+        global _AIRFRAME_ONLY
+        _AIRFRAME_ONLY = self.prev
 
 
 class fast_tess:
@@ -118,6 +129,10 @@ def values(P):
     fa = jload(FAIR_F)
     if fa and fa.get("items"):
         out["_fairings"] = fa["items"]
+    if _AIRFRAME_ONLY:
+        for k in ("model.has_propulsion", "model.has_gear", "model.has_details"):
+            out[k] = 0.0
+        out.pop("_fairings", None)
     return out
 
 LIMITS = {   # physically plausible absolute ranges (the search window never leaves them)
@@ -277,6 +292,29 @@ def belly_z(P, x):
     return -float(P.get("fuselage.max_height", 5.0)) / 2.0
 
 
+def pylon_dims(P):
+    """Pylon between the nacelle top and the wing underside: (x0, chord, span, t/c, location) or None."""
+    L, D = P["nacelle.length"], P["nacelle.diameter"]
+    x, y, z = P["nacelle.x"], abs(P["nacelle.y"]), P["nacelle.z"]
+    xle, ch, zc, th = wing_at(P, y)
+    z_top = z + D / 2.0
+    h = (zc - 0.5 * th) - (z_top - 0.2)
+    if h <= 0.15:
+        return None
+    x0 = x + 0.12 * L
+    chord = max(xle + 0.40 * ch - x0, 1.0)
+    return x0, chord, h + 0.1, min(0.65 / chord, 0.2), (x0, y, z_top - 0.2)
+
+def fair_dims(P, it):
+    """Length, width, height and location of one flap-track fairing."""
+    y = abs(it["y"]); wd = it["width"]; h = it.get("height", wd)
+    if "z" in it:
+        z = it["z"]
+    else:
+        xle, ch, zc, th = wing_at(P, y); z = zc - 0.5 * th - 0.35 * wd
+    return it["length"], wd, h, (it["x"], y, z)
+
+
 class OpenVSPAdapter:
     _last_report = None
 
@@ -339,10 +377,18 @@ class OpenVSPAdapter:
 
     _fuse_sig = None
     _fuse_id = None
+    _sess = None
+    _no_session = False        # True: every evaluation rebuilds the model (set automatically if updates are not effective)
+
+    @staticmethod
+    def _struct_sig(P, fsig):
+        prop = (float(P.get("model.has_propulsion", 0.0)) >= 0.5 and "nacelle.x" in P
+                and P.get("nacelle.length", 0) >= 0.1 and P.get("nacelle.diameter", 0) >= 0.05)
+        return (fsig, bool(prop), bool(prop and pylon_dims(P)), len(P.get("_fairings") or []))
 
     def build(self, P):
         v = self.v
-        self._pc = {}
+        self._pc = {}; self._ids = {}
         s = _get_tess_scale()
         fw = int(round((TESS_W + 8) * s)); fu = int(round(TESS_U * s))
         rep_ = (round(s, 3), _FAST)
@@ -351,7 +397,7 @@ class OpenVSPAdapter:
                   f"fuselage Tess_W={fw} Tess_U={fu}")
             OpenVSPAdapter._last_report = rep_
         sig = None
-        if _FAST and P.get("_stations"):                      # during optimisation the fuselage never changes
+        if _FAST and P.get("_stations") and not os.environ.get("AIRCRAFT_NO_SESSION"):                      # during optimisation the fuselage never changes
             sig = (round(float(P["fuselage.length"]), 4), round(s, 3),
                    tuple((round(t["x"], 3), round(t["width"], 3), round(t["height"], 3), round(t["z_center"], 3))
                          for t in P["_stations"]),
@@ -361,6 +407,18 @@ class OpenVSPAdapter:
             try:
                 ids = list(v.FindGeoms())
                 if OpenVSPAdapter._fuse_id in ids and v.GetGeomName(OpenVSPAdapter._fuse_id) == "Fuselage":
+                    sess = OpenVSPAdapter._sess
+                    if sess and sess["sig"] == self._struct_sig(P, sig):
+                        flat = [g for x in sess["ids"].values() for g in (x if isinstance(x, list) else [x])]
+                        if all(g in ids for g in flat) and not OpenVSPAdapter._no_session:   # only parameters change
+                            self._ids = sess["ids"]
+                            try:
+                                self._update(P)
+                                return
+                            except Exception as e:                 # not effective in this OpenVSP: rebuild every time
+                                OpenVSPAdapter._no_session = True
+                                print(f"  note: in-place update failed ({e}); full rebuilds from now on")
+                                self._ids = {}
                     for g in ids:
                         if g != OpenVSPAdapter._fuse_id:
                             v.DeleteGeom(g)
@@ -369,7 +427,7 @@ class OpenVSPAdapter:
                 f = None
         if f is None:
             v.ClearVSPModel()
-            OpenVSPAdapter._fuse_sig = None; OpenVSPAdapter._fuse_id = None
+            OpenVSPAdapter._fuse_sig = None; OpenVSPAdapter._fuse_id = None; OpenVSPAdapter._sess = None
             f = v.AddGeom("FUSELAGE"); v.SetGeomName(f, "Fuselage")
             self._tess(f, w=TESS_W + 8, u=TESS_U)
             v.SetParmVal(f, "Length", "Design", P["fuselage.length"])
@@ -386,9 +444,10 @@ class OpenVSPAdapter:
                     v.SetParmVal(v.GetXSecParm(xs, "Ellipse_Height"), k * P["fuselage.max_height"])
             if sig is not None:
                 OpenVSPAdapter._fuse_sig = sig; OpenVSPAdapter._fuse_id = f
-        self._wing("Wing", "wing", P, False)
-        self._wing("HTail", "htail", P, False)
-        self._wing("VTail", "vtail", P, True)
+        self._ids["Wing"] = self._wing("Wing", "wing", P, False)
+        self._ids["HTail"] = self._wing("HTail", "htail", P, False)
+        self._ids["VTail"] = self._wing("VTail", "vtail", P, True)
+        self._verify_wings(P)
         extra = self._add_propulsion_and_gear(P)
         v.Update()
         ng = len(v.FindGeoms())
@@ -396,10 +455,59 @@ class OpenVSPAdapter:
         if ng != expected:
             raise RuntimeError(f"expected {expected} geometries in the model, found {ng}")
         L = float(P["fuselage.length"]); span = max(float(P["wing.span"]), float(P["htail.span"]))
-        for name, bb in ([] if _FAST else self.geom_report()):     # (evaluate() has its own size check while optimising)                   # a component far bigger than the aircraft = broken parameters
+        for name, bb in ([] if _FAST else self.geom_report()):     # (evaluate() has its own size check while optimising)
             if bb.get("X_Len", 0) > 2.2 * L or bb.get("Y_Len", 0) > 2.2 * span or bb.get("Z_Len", 0) > 2.2 * L:
                 raise RuntimeError(f"geometry '{name}' is oversized: bbox={ {k: round(x, 1) for k, x in bb.items()} } "
                                    f"(fuselage.length={L}, span={span}). Run `inspect`.")
+        OpenVSPAdapter._sess = {"sig": self._struct_sig(P, sig), "ids": self._ids} if sig is not None else None
+
+    def _update(self, P):
+        """Same model structure as the previous evaluation: only set the changed parameters."""
+        v = self.v; ids = self._ids
+        for key, pre, vert in (("Wing", "wing", False), ("HTail", "htail", False), ("VTail", "vtail", True)):
+            self._wing_params(ids[key], pre, P, vert)
+            self._wing_thickness(ids[key], pre, P)
+        if "nacelle" in ids:
+            self._body_update(ids["nacelle"], P["nacelle.length"], NAC_PROF, P["nacelle.diameter"],
+                              (P["nacelle.x"], abs(P["nacelle.y"]), P["nacelle.z"]))
+        if "pylon" in ids:
+            pd = pylon_dims(P)
+            if pd:
+                self._plate_update(ids["pylon"], pd[1], pd[2], pd[3], pd[4])
+        for gid, it in zip(ids.get("fair", []), P.get("_fairings") or []):
+            L, wd, h, loc = fair_dims(P, it)
+            self._body_update(gid, L, FAIR_PROF, wd, loc, H=h)
+        v.Update()
+        got = v.GetParmVal(ids["Wing"], "X_Rel_Location", "XForm")          # read back: did the update take effect?
+        if abs(got - P["wing.x"]) > 1e-6:
+            raise RuntimeError(f"wing.x reads back {got:.4f}, expected {P['wing.x']:.4f}")
+        self._verify_wings(P)
+
+    def _body_update(self, f, L, prof, D, loc, H=None):
+        v = self.v
+        L = max(float(L), 0.1); D = max(float(D), 0.05); H = D if H is None else max(float(H), 0.05)
+        v.SetParmVal(f, "Length", "Design", L)
+        for ax, val in zip("XYZ", loc):
+            v.SetParmVal(f, f"{ax}_Rel_Location", "XForm", float(val))
+        surf = v.GetXSecSurf(f, 0)
+        for i, (fx, fd) in enumerate(prof):
+            if 0 < i < len(prof) - 1:
+                xs = v.GetXSec(surf, i)
+                v.SetParmVal(v.GetXSecParm(xs, "Ellipse_Width"), max(fd * D, 0.05))
+                v.SetParmVal(v.GetXSecParm(xs, "Ellipse_Height"), max(fd * H, 0.05))
+
+    def _plate_update(self, w, chord, span, tc, loc):
+        v = self.v
+        for nm, val in (("Span", span), ("Root_Chord", chord), ("Tip_Chord", chord)):
+            self._wset(w, nm, val)
+        for ax, val in zip("XYZ", loc):
+            v.SetParmVal(w, f"{ax}_Rel_Location", "XForm", float(val))
+        if getattr(self, "thickness_ok", True):
+            surf = v.GetXSecSurf(w, 0)
+            for i in (0, 1):
+                pid = self._curve_parm(v.GetXSec(surf, i), ("ThickChord", "Thick_Chord", "ThickChordRatio"))
+                if pid:
+                    v.SetParmVal(pid, float(tc))
 
     _tess_missing = set()
 
@@ -480,28 +588,74 @@ class OpenVSPAdapter:
                 except Exception:
                     pass
 
+    def _wset(self, w, name, val):
+        """Set a wing-section parameter through the section handle (it survives airfoil-shape changes, which rename the
+        'XSec_1' group); the group name is only a last resort."""
+        v = self.v
+        surf = v.GetXSecSurf(w, 0)
+        for idx in (1, 2, 0):
+            try:
+                if idx >= v.GetNumXSec(surf):
+                    continue
+                pid = v.GetXSecParm(v.GetXSec(surf, idx), name)
+                if pid and v.ValidParm(pid):
+                    v.SetParmVal(pid, float(val))
+                    return True
+            except Exception:
+                continue
+        v.SetParmVal(w, name, "XSec_1", float(val))
+        return False
+
+    def _wget(self, w, name):
+        v = self.v
+        surf = v.GetXSecSurf(w, 0)
+        for idx in (1, 2, 0):
+            try:
+                if idx >= v.GetNumXSec(surf):
+                    continue
+                pid = v.GetXSecParm(v.GetXSec(surf, idx), name)
+                if pid and v.ValidParm(pid):
+                    return v.GetParmVal(pid)
+            except Exception:
+                continue
+        return None
+
     def _wing(self, name, pre, P, vertical):
         v = self.v
         w = v.AddGeom("WING"); v.SetGeomName(w, name)
         self._tess(w, w=TESS_W)
-        v.SetParmVal(w, "X_Rel_Location", "XForm", P[pre + ".x"])
-        v.SetParmVal(w, "Z_Rel_Location", "XForm", P[pre + ".z"])
         v.SetParmVal(w, "Sym_Planar_Flag", "Sym", 0 if vertical else v.SYM_XZ)
         if vertical:
             v.SetParmVal(w, "X_Rel_Rotation", "XForm", 90.0)
         v.SetDriverGroup(w, 1, v.SPAN_WSECT_DRIVER, v.ROOTC_WSECT_DRIVER, v.TIPC_WSECT_DRIVER)
-        dih = 0.0 if vertical else float(P.get(pre + ".dihedral", 0.0))
-        span = P[pre + ".height"] if vertical else P[pre + ".span"] / 2.0 / np.cos(np.radians(dih))
-        for nm, val in (("Span", span), ("Root_Chord", P[pre + ".root_chord"]),
-                        ("Tip_Chord", P[pre + ".tip_chord"]), ("Sweep_Location", 0.0),
-                        ("Sweep", P[pre + ".sweep"])):
-            v.SetParmVal(w, nm, "XSec_1", val)
-        if pre + ".dihedral" in P:
-            v.SetParmVal(w, "Dihedral", "XSec_1", P[pre + ".dihedral"])
+        self._wing_params(w, pre, P, vertical)                 # section parameters BEFORE changing the airfoil shape
         if pre + ".thickness" in P and getattr(self, "thickness_ok", True):
             surf = v.GetXSecSurf(w, 0)
             for i in (0, 1):
                 v.ChangeXSecShape(surf, i, v.XS_FOUR_SERIES)
+            self._wing_thickness(w, pre, P)
+        return w
+
+    def _wing_span(self, pre, P, vertical):
+        dih = 0.0 if vertical else float(P.get(pre + ".dihedral", 0.0))
+        return P[pre + ".height"] if vertical else P[pre + ".span"] / 2.0 / np.cos(np.radians(dih))
+
+    def _wing_params(self, w, pre, P, vertical):
+        v = self.v
+        v.SetParmVal(w, "X_Rel_Location", "XForm", P[pre + ".x"])
+        v.SetParmVal(w, "Z_Rel_Location", "XForm", P[pre + ".z"])
+        items = [("Span", self._wing_span(pre, P, vertical)), ("Root_Chord", P[pre + ".root_chord"]),
+                 ("Tip_Chord", P[pre + ".tip_chord"]), ("Sweep_Location", 0.0), ("Sweep", P[pre + ".sweep"])]
+        if pre + ".dihedral" in P:
+            items.append(("Dihedral", P[pre + ".dihedral"]))
+        for nm, val in items:
+            self._wset(w, nm, val)
+        return w
+
+    def _wing_thickness(self, w, pre, P):
+        v = self.v
+        if pre + ".thickness" in P and getattr(self, "thickness_ok", True):
+            surf = v.GetXSecSurf(w, 0)
             for i in (0, 1):
                 xs = v.GetXSec(surf, i)
                 pid = self._curve_parm(xs, ("ThickChord", "Thick_Chord", "ThickChordRatio"))
@@ -513,6 +667,15 @@ class OpenVSPAdapter:
                 cid = self._curve_parm(xs, ("Camber",))
                 if cid:
                     v.SetParmVal(cid, 0.0)
+
+    def _verify_wings(self, P):
+        """A wing whose parameters were silently ignored stays at OpenVSP's default size: fail loudly instead."""
+        for key, pre, vert in (("Wing", "wing", False), ("HTail", "htail", False), ("VTail", "vtail", True)):
+            exp = self._wing_span(pre, P, vert)
+            got = self._wget(self._ids[key], "Span")
+            if got is None or abs(got - exp) > 1e-3 * max(1.0, abs(exp)):
+                raise RuntimeError(f"{key}: parameters were not applied (Span reads {got}, expected {exp:.3f}); "
+                                   f"run `probe` and send the output")
 
     # ---- components made only with calls already proven on this machine (fuselage-type bodies and wing-type plates)
     def _place(self, g, loc, rot=(0.0, 0.0, 0.0), mirror=False):
@@ -561,31 +724,26 @@ class OpenVSPAdapter:
         v.SetDriverGroup(w, 1, v.SPAN_WSECT_DRIVER, v.ROOTC_WSECT_DRIVER, v.TIPC_WSECT_DRIVER)
         for nm, val in (("Span", span), ("Root_Chord", chord), ("Tip_Chord", chord),
                         ("Sweep_Location", 0.0), ("Sweep", 0.0)):
-            v.SetParmVal(w, nm, "XSec_1", float(val))
+            self._wset(w, nm, val)
         self._thickness(w, tc)
         return w
 
     def _propulsion(self, P):
         L, D = P["nacelle.length"], P["nacelle.diameter"]
         x, y, z = P["nacelle.x"], abs(P["nacelle.y"]), P["nacelle.z"]
-        self._body("Nacelle", L, NAC_PROF, D, (x, y, z), mirror=True)
+        self._ids["nacelle"] = self._body("Nacelle", L, NAC_PROF, D, (x, y, z), mirror=True)
         if not _FAST and P.get("engine.length", 0) >= 0.1 and P.get("engine.diameter", 0) >= 0.05:
             self._body("Engine", P["engine.length"], ENG_PROF, P["engine.diameter"],
                        (P["engine.x"], abs(P["engine.y"]), P["engine.z"]), mirror=True)
-        xle, ch, zc, th = wing_at(P, y)                       # pylon: vertical plate from nacelle top to the wing
-        z_top = z + D / 2.0
-        h = (zc - 0.5 * th) - (z_top - 0.2)
-        if h > 0.15:
-            x0 = x + 0.12 * L
-            chord = max(xle + 0.40 * ch - x0, 1.0)
-            self._plate("Pylon", chord, h + 0.1, min(0.65 / chord, 0.2), (x0, y, z_top - 0.2),
-                        rot=(90.0, 0.0, 0.0), mirror=True)
+        pd = pylon_dims(P)                                    # vertical plate from nacelle top to the wing underside
+        if pd:
+            self._ids["pylon"] = self._plate("Pylon", pd[1], pd[2], pd[3], pd[4], rot=(90.0, 0.0, 0.0), mirror=True)
 
     def _fairings(self, P):
+        self._ids["fair"] = []
         for i, it in enumerate(P.get("_fairings") or []):
-            y = abs(it["y"]); xle, ch, zc, th = wing_at(P, y)
-            self._body(f"TrackFairing_{i + 1}", it["length"], FAIR_PROF, it["width"],
-                       (it["x"], y, zc - 0.5 * th - 0.35 * it["width"]), mirror=True)
+            L, wd, h, loc = fair_dims(P, it)
+            self._ids["fair"].append(self._body(f"TrackFairing_{i + 1}", L, FAIR_PROF, wd, loc, mirror=True, H=h))
 
     def _gear(self, P):
         """Landing-gear skeleton: struts, bogie beam, wheels and door panels, attached to the wing/belly."""
@@ -789,7 +947,9 @@ def imwrite(path, img):
     print(f"WARNING: {path.name} is locked; wrote {alt.name} instead.")
 
 
-def extract_mask(img_path, flip=False):
+def extract_mask(img_path, flip=False, keep_length=None, keep_min_m2=0.15):
+    """Silhouette from a drawing. With keep_length (the real length of the main outline) detached parts near the
+    aircraft (landing-gear wheels...) are kept too, so they can be selected with erase-mask / restore-mask."""
     import cv2
     g = imread(img_path, 0)
     if g is None:
@@ -801,7 +961,19 @@ def extract_mask(img_path, flip=False):
     sil = cv2.bitwise_or(b, ff)
     n, lab, st, _ = cv2.connectedComponentsWithStats(sil)
     if n > 1:
-        sil = ((lab == 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))) * 255).astype(np.uint8)
+        main = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+        out = lab == main
+        if keep_length:
+            mx, my, mw, mh = [int(t) for t in st[main, :4]]
+            ppm = mw / float(keep_length)
+            for i in range(1, n):
+                if i == main or st[i, cv2.CC_STAT_AREA] < keep_min_m2 * ppm ** 2:
+                    continue
+                x, y, w, h = [int(t) for t in st[i, :4]]
+                cx, cy = x + w / 2.0, y + h / 2.0
+                if mx - 0.01 * mw <= cx <= mx + 1.01 * mw and my - 0.4 * mh <= cy <= my + 1.4 * mh:
+                    out = out | (lab == i)
+        sil = (out * 255).astype(np.uint8)
     return cv2.flip(sil, 1) if flip else sil
 
 def metrics(ref, mod, ppm):
@@ -856,11 +1028,14 @@ def calibration_problems(P=None, V=None):
     P = P or jload(PARAMS) or {}; V = V if V is not None else jload(VIEWS_F, {})
     if "fuselage.length" not in P or "wing.span" not in P:
         return []
+    key_of = {"top": "fuselage.length", "side": "fuselage.length", "front": "wing.span"}
     exp = {"top": P["fuselage.length"]["value"], "side": P["fuselage.length"]["value"] * 54.08 / 53.85,
            "front": P["wing.span"]["value"]}
     out = []
     for v, c in V.items():
         L = c.get("length_m")
+        if P[key_of.get(v, "fuselage.length")].get("evidence_class") == "unknown":
+            continue                                              # placeholder parameters (fresh `init`): nothing to compare with
         if L and v in exp and abs(L - exp[v]) / exp[v] > 0.06:
             out.append((v, L, round(exp[v], 2)))
     return out
@@ -883,12 +1058,22 @@ def cmd_rescale(a):
     print(f"{a.view}: {old:.2f} -> {c['ppm']:.2f} px/m (length {a.length} m)")
 
 
+def _sync_dims_from_view(view, length):
+    """Fresh `init` parameters are placeholders: the first calibration of a view gives the real size (any aircraft)."""
+    P = jload(PARAMS)
+    key = {"top": "fuselage.length", "front": "wing.span"}.get(view)
+    if P and key in P and P[key].get("evidence_class") == "unknown":
+        P[key].update({"value": float(length), "evidence_class": "calculated", "confidence": 0.6,
+                       "source": f"calibration of the {view} view", "notes": "set from the calibration length"})
+        jsave(PARAMS, P)
+        print(f"  {key} was a placeholder: set to {length} m from this calibration (edit params.json to refine/fix it)")
+
 def cmd_calibrate(a):
     import cv2
     HOME.mkdir(exist_ok=True)
     for d in DIRS: (HOME / d).mkdir(exist_ok=True)
     src = a.image
-    mask = imread(a.mask, 0) if a.mask else extract_mask(src, a.flip)
+    mask = imread(a.mask, 0) if a.mask else extract_mask(src, a.flip, a.length if a.keep_parts else None, a.keep_min_area)
     if a.mask and a.flip: mask = cv2.flip(mask, 1)
     ys, xs = np.where(mask > 0)
     x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
@@ -900,6 +1085,7 @@ def cmd_calibrate(a):
                  "flip": a.flip, "length_m": a.length, "unit": "m", "confidence": None}
     jsave(VIEWS_F, V)
     print(f"{a.view}: {ppm:.2f} px/m, bbox {x0, x1, y0, y1}. CHECK processed/{a.view}_mask.png.")
+    _sync_dims_from_view(a.view, a.length)
     for v_, L_, e_ in calibration_problems(None, {a.view: V[a.view]}):
         print(f"  WARNING: --length {L_} looks wrong for the {v_} view (expected about {e_} m: "
               f"{'wing span' if v_ == 'front' else 'overall length'}). Fix: rescale --view {v_} --length {e_}")
@@ -1317,6 +1503,23 @@ def cmd_inspect(a):
               f"python aircraft_recon.py rescale --view {v} --length {e}")
 
 
+def use_masks(kind):
+    """Activate the mask variant 'core' (no engines/gear) or 'extras' (with engines) for every view that has it."""
+    V = jload(VIEWS_F, {}); changed = []
+    for view, c in V.items():
+        p = Path(c["mask"]).with_name(f"{view}_mask_{kind}.png")
+        if p.exists():
+            m = imread(p, 0); imwrite(c["mask"], m)
+            ys, xs = np.where(m > 0)
+            c["bbox"] = [int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())]
+            changed.append(view)
+    jsave(VIEWS_F, V)
+    return changed
+
+def cmd_masks(a):
+    ch = use_masks(a.use)
+    print(f"active masks: {a.use} for {ch or 'no view (no *_mask_%s.png found)' % a.use}")
+
 def cmd_restore_mask(a):
     """Put back parts that erase-mask removed (e.g. the engines), choosing only the rectangles you select."""
     import cv2
@@ -1326,6 +1529,9 @@ def cmd_restore_mask(a):
     full_p = Path(c["mask"]).with_name(f"{a.view}_mask_full.png")
     if not full_p.exists(): sys.exit("nothing was erased in this view (no *_mask_full.png)")
     full = imread(full_p, 0)
+    core_p = Path(c["mask"]).with_name(f"{a.view}_mask_core.png")
+    if not core_p.exists():
+        imwrite(core_p, cur)                                  # engine-free mask, used by phase 1 of `auto`
     rects = [tuple(r) for r in (a.rect or [])]
     if not rects:
         z = a.zoom
@@ -1339,7 +1545,36 @@ def cmd_restore_mask(a):
     ys, xs = np.where(cur > 0)
     c["bbox"] = [int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())]
     imwrite(c["mask"], cur); jsave(VIEWS_F, V)
-    print(f"{a.view}: restored {len(rects)} region(s); bbox {c['bbox']}")
+    imwrite(Path(c["mask"]).with_name(f"{a.view}_mask_extras.png"), cur)   # mask with engines, used by phase 2
+    print(f"{a.view}: restored {len(rects)} region(s); bbox {c['bbox']}  (core/extras variants saved)")
+
+
+def cmd_selfcheck(a):
+    """Is the fast in-place update identical to a full rebuild? (settles 'the optimiser does not move the wing')"""
+    P = jload(PARAMS); Q = values(P)
+    stat = lambda t: (len(t), t[:, :, 0].min(), t[:, :, 0].max(), t[:, :, 1].max(), t[:, :, 2].min(), t[:, :, 2].max(), float(t[:, :, 0].sum()))
+    Q2 = dict(Q); Q2["wing.x"] = Q["wing.x"] + 2.0; Q2["wing.sweep"] = Q["wing.sweep"] + 3.0
+    with fast_tess():
+        A = OpenVSPAdapter(); OpenVSPAdapter._no_session = False
+        A.build(Q); t1 = A.export_stl(HOME / "renders" / "opt.stl")
+        A.build(Q2); t2 = A.export_stl(HOME / "renders" / "opt.stl")
+        used = OpenVSPAdapter._sess is not None and not OpenVSPAdapter._no_session
+        OpenVSPAdapter._no_session = True
+        A.build(Q2); t3 = A.export_stl(HOME / "renders" / "opt.stl")
+        OpenVSPAdapter._no_session = False
+    s1, s2, s3 = stat(t1), stat(t2), stat(t3)
+    print("                     triangles   x min   x max   y max   z min   z max   sum x")
+    for nm, st_ in (("original", s1), ("in-place update", s2), ("full rebuild", s3)):
+        print(f"  {nm:16s} {st_[0]:9d} " + " ".join(f"{x:7.2f}" for x in st_[1:6]) + f" {st_[6]:10.1f}")
+    moved = abs(s2[6] - s1[6]) > 1e-3
+    same = s2[0] == s3[0] and all(abs(x - y) < 1e-3 for x, y in zip(s2[1:], s3[1:]))
+    print(f"\n  the parameters changed the mesh: {'YES' if moved else 'NO'}   in-place == full rebuild: {'YES' if same else 'NO'}"
+          f"   (in-place path used: {'yes' if used else 'no, it fell back'})")
+    if moved and same:
+        print("  -> the fast path is correct. If the optimiser stalls, the reason is the objective, not the update.")
+    else:
+        OpenVSPAdapter._no_session = True
+        print("  -> the fast path is NOT reliable here: use AIRCRAFT_NO_SESSION=1 (full rebuild for every evaluation).")
 
 
 def cmd_probe(a):
@@ -1423,7 +1658,8 @@ def cmd_compare(a):
     jsave(HOME / "renders" / "metrics.json", out)
     print(json.dumps(out, indent=2))
 
-def run_optimize(free, W, iters=80, method="Powell", allow_measured=False, wide=1.0, skip_fixed=False, commit_now=True):
+def run_optimize(free, W, iters=80, method="Powell", allow_measured=False, wide=1.0, skip_fixed=False, commit_now=True,
+                 patience=24):
     from scipy.optimize import minimize
     refs, P = load_refs(EVAL_DS), jload(PARAMS)
     free = [k for k in free if k in P]
@@ -1444,14 +1680,40 @@ def run_optimize(free, W, iters=80, method="Powell", allow_measured=False, wide=
         for xi, k, (lo, hi) in zip(x, free, B):
             Q[k] = lo + float(np.clip(xi, 0, 1)) * (hi - lo)
         return Q
+    class _Stop(Exception):
+        pass
+    state = {"best": float("inf"), "x": x0.copy(), "n": 0, "mark": 0, "ref": 1.0}
     def f(x):
         A.build(apply(x))
-        return evaluate(A.export_stl(tmp), refs, W, Lref)[0]
+        val = evaluate(A.export_stl(tmp), refs, W, Lref)[0]
+        state["n"] += 1
+        state.setdefault("vals", []).append(val); state.setdefault("xs", set()).add(tuple(np.round(x, 6)))
+        if os.environ.get("AIRCRAFT_VERBOSE"):
+            print(f"    eval {state['n']:3d}: {val:.6f}")
+        if state["n"] == 8 and not OpenVSPAdapter._no_session and len(state["xs"]) >= 3 \
+                and max(state["vals"]) - min(state["vals"]) < 1e-12:
+            OpenVSPAdapter._no_session = True; OpenVSPAdapter._sess = None
+            print("  note: 8 different parameter sets gave exactly the same error -> in-place updates are not effective "
+                  "here; switching to full rebuilds")
+            state["mark"] = state["n"]
+        if val < state["best"]:
+            if val < state["best"] - 0.002 * state["ref"]:     # a real (>0.2 %) improvement resets the patience
+                state["mark"] = state["n"]
+            state["best"], state["x"] = val, np.array(x, float)
+        if state["n"] - state["mark"] >= patience:
+            raise _Stop()
+        return val
     with fast_tess():                                         # coarse mesh while searching; fine mesh when saving
         A.build(values(P)); before_t, before = evaluate(A.export_stl(tmp), refs, W, Lref)
-        res = minimize(f, x0, method=method, bounds=[(0, 1)] * len(x0),
-                       options={"maxfev": iters, "xtol": 5e-3, "ftol": 1e-4} if method == "Powell"
-                       else {"maxiter": iters})
+        state["best"], state["ref"] = before_t, max(before_t, 1e-9)
+        try:
+            res = minimize(f, x0, method=method, bounds=[(0, 1)] * len(x0),
+                           options={"maxfev": iters, "xtol": 5e-3, "ftol": 1e-4} if method == "Powell"
+                           else {"maxiter": iters})
+        except _Stop:
+            res = types.SimpleNamespace(nfev=state["n"])
+        res.x = state["x"]                                    # best point seen, not just the last one
+        res.nfev = state["n"]
         Q = apply(res.x)
         A.build(Q); after_t, after = evaluate(A.export_stl(tmp), refs, W, Lref)
     rec = {"iteration": len(list((HOME / "iterations").glob("*.json"))) + 1, "free": free,
@@ -1506,7 +1768,94 @@ def sync_engine(P):
             P[k]["value"] = round(val, 4); P[k]["evidence_class"] = "calculated"
             P[k]["notes"] = "derived from the nacelle"
 
+def _total_error(calibrated, refs):
+    P = jload(PARAMS)
+    W = {v: 1.0 for v in VIEWS if v in calibrated}
+    with fast_tess():
+        A = OpenVSPAdapter(); A.build(values(P))
+        return evaluate(A.export_stl(HOME / "renders" / "opt.stl"), refs, W, P["fuselage.length"]["value"])[0]
+
+def _pause(a, label, snapshot=None):
+    """--step: show overlays/metrics and let the user continue, undo the last step or quit."""
+    if not getattr(a, "step", False):
+        return "continue"
+    try:
+        cmd_compare(a)
+    except SystemExit:
+        pass
+    if not sys.stdin.isatty():
+        return "continue"
+    while True:
+        r = input(f"  >> after '{label}': overlays in project\\renders.  [Enter] continue | [u] undo this step | [q] quit : ").strip().lower()
+        if r == "":
+            return "continue"
+        if r == "u" and snapshot is not None:
+            jsave(PARAMS, snapshot); print("  step undone"); return "undo"
+        if r == "q":
+            sys.exit("stopped by the user (nothing else changed)")
+
+def prepare_masks(a, calibrated):
+    """Engines/gear selection inside auto: erase them (core masks), then put the engines back (extras masks)."""
+    for v in ("top", "side", "front"):
+        if v not in calibrated:
+            continue
+        V = jload(VIEWS_F, {}); c = V[v]; mp = Path(c["mask"])
+        for kind in ("core", "extras"):
+            mp.with_name(f"{v}_mask_{kind}.png").unlink(missing_ok=True)
+        full = mp.with_name(f"{v}_mask_full.png")
+        if full.exists():                                         # start again from the complete silhouette
+            m = imread(full, 0); imwrite(mp, m); ys, xs = np.where(m > 0)
+            c["bbox"] = [int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())]; jsave(VIEWS_F, V)
+        print(f"--- {v}: (1) rectangle around the ENGINES and the LANDING GEAR to remove; (2) then around the ENGINES to put back")
+        cmd_erase_mask(types.SimpleNamespace(view=v, rect=None, zoom=a.zoom))
+        cmd_restore_mask(types.SimpleNamespace(view=v, rect=None, zoom=a.zoom))
+
+def _stages_loop(a, calibrated, stages, label):
+    last = None
+    for p in range(1, a.passes + 1):
+        print(f"=== {label}: pass {p}/{a.passes} ===")
+        if {"top", "side"} <= calibrated and label == "airframe":
+            print("- fuselage from silhouettes")
+            fit_fuselage(jload(PARAMS), a.stations)
+        with fast_tess():
+            probe_a = OpenVSPAdapter(); probe_a.build(values(jload(PARAMS)))
+        thick_ok = getattr(probe_a, "thickness_ok", True)
+        for name, free, w in stages:
+            if not thick_ok and any(k.endswith(".thickness") for k in free):
+                print(f"- {name}: skipped (thickness parameter not available)"); continue
+            W = {v: (w.get(v, 0.0) if v in calibrated else 0.0) for v in VIEWS}
+            if sum(W.values()) == 0:
+                print(f"- {name}: skipped (needs a calibrated view)"); continue
+            print(f"- {name}")
+            snap = jload(PARAMS); guard = getattr(a, "guard", True)
+            refs_all = load_refs(EVAL_DS) if guard else None
+            tot0 = _total_error(calibrated, refs_all) if guard else None
+            run_optimize(free, W, a.iters, "Powell", False, a.wide, skip_fixed=True, commit_now=False)
+            if guard:
+                tot1 = _total_error(calibrated, refs_all)
+                if tot1 > tot0 * 1.02:                            # a stage must not make the whole aircraft worse
+                    jsave(PARAMS, snap)
+                    print(f"  guard: overall error {tot0:.4f} -> {tot1:.4f} (worse): stage reverted")
+                else:
+                    print(f"  overall error {tot0:.4f} -> {tot1:.4f}")
+            _pause(a, name, snap)
+        P1 = jload(PARAMS)
+        if float(P1.get("model.has_propulsion", {"value": 0.0})["value"]) >= 0.5:
+            sync_engine(P1); jsave(PARAMS, P1)
+        commit(jload(PARAMS), f"auto {label} pass {p}", [], reason="stages of one automatic pass")
+        W = {v: 1.0 for v in VIEWS if v in calibrated}
+        refs, P = load_refs(EVAL_DS), jload(PARAMS)
+        with fast_tess():
+            A = OpenVSPAdapter(); A.build(values(P))
+            tot = evaluate(A.export_stl(HOME / "renders" / "opt.stl"), refs, W, P["fuselage.length"]["value"])[0]
+        print(f"  overall error after pass {p}: {tot:.5f}")
+        if last is not None and abs(last - tot) < 0.01 * last:
+            print("  converged (<1% change)"); break
+        last = tot
+
 def cmd_auto(a):
+    """Phases: 1 airframe (fuselage, wing, tails; masks without engines) -> 2 nacelles + pylons + fairings
+    (masks with engines) -> 3 finish (gear, control surfaces, windows, fine mesh)."""
     require_calibration()
     calibrated = set(jload(VIEWS_F, {}))
     if not calibrated:
@@ -1519,42 +1868,45 @@ def cmd_auto(a):
                  "confidence": 0.2, "fixed": False, "notes": "default estimate"}
     if added:
         jsave(PARAMS, P0); print("Added new parameters with default estimates:", added)
-    print("Calibrated views:", sorted(calibrated))
-    has_prop = float(P0.get("model.has_propulsion", {"value": 0.0})["value"]) >= 0.5
-    print("Nacelles/gear in model:", has_prop, "| saved tess_scale:", _get_tess_scale())
-    if not has_prop:
-        print("  (run `nacelle-fit` once to add the nacelles if the masks contain the engines)")
-    last = None
-    for p in range(1, a.passes + 1):
-        print(f"=== pass {p}/{a.passes} ===")
-        if {"top", "side"} <= calibrated:
-            print("- fuselage from silhouettes")
-            P0 = jload(PARAMS)
-            fit_fuselage(P0, a.stations)
-        with fast_tess():
-            probe_a = OpenVSPAdapter(); probe_a.build(values(jload(PARAMS)))
-        thick_ok = getattr(probe_a, "thickness_ok", True)
-        stages = list(STAGES) + ([PROP_STAGE] if has_prop else [])
-        for name, free, w in stages:
-            if not thick_ok and any(k.endswith(".thickness") for k in free):
-                print(f"- {name}: skipped (thickness parameter not available)"); continue
-            W = {v: (w.get(v, 0.0) if v in calibrated else 0.0) for v in VIEWS}
-            if sum(W.values()) == 0:
-                print(f"- {name}: skipped (needs a calibrated view)"); continue
-            print(f"- {name}")
-            run_optimize(free, W, a.iters, "Powell", False, a.wide, skip_fixed=True, commit_now=False)
-        if has_prop:
-            P1 = jload(PARAMS); sync_engine(P1); jsave(PARAMS, P1)
-        commit(jload(PARAMS), f"auto pass {p}", [], reason="stages of one automatic pass")
-        W = {v: 1.0 for v in VIEWS if v in calibrated}
-        refs, P = load_refs(EVAL_DS), jload(PARAMS)
-        with fast_tess():
-            A = OpenVSPAdapter(); A.build(values(P))
-            tot = evaluate(A.export_stl(HOME / "renders" / "opt.stl"), refs, W, P["fuselage.length"]["value"])[0]
-        print(f"  overall error after pass {p}: {tot:.5f}")
-        if last is not None and abs(last - tot) < 0.01 * last:
-            print("  converged (<1% change)"); break
-        last = tot
+    print("Calibrated views:", sorted(calibrated), "| phase:", a.phase)
+    have = all(Path(jload(VIEWS_F)[v]["mask"]).with_name(f"{v}_mask_core.png").exists() for v in calibrated)
+    if a.phase != "finish" and (getattr(a, "masks", False) or (not have and sys.stdin.isatty())):
+        if getattr(a, "masks", False) or input("No core/extras masks yet. Select engines and gear now? [Y/n] ").strip().lower() != "n":
+            prepare_masks(a, calibrated)
+    if a.phase in ("airframe", "all"):
+        print("##### PHASE 1: airframe (fuselage, wing, tails) on masks WITHOUT engines")
+        ch = use_masks("core")
+        if not ch:
+            print("  (no *_mask_core.png: using the current masks)")
+        with airframe_only():
+            _stages_loop(a, calibrated, STAGES, "airframe")
+    if a.phase in ("extras", "all"):
+        print("##### PHASE 2: nacelles, pylons, track fairings on masks WITH engines")
+        ch = use_masks("extras")
+        if not ch:
+            print("  (no *_mask_extras.png: using the current masks; put the engines back with restore-mask)")
+        P = jload(PARAMS)
+        if float(P["model.has_propulsion"]["value"]) < 0.5 or a.refit:
+            snap2 = jload(PARAMS)
+            cmd_nacelle_fit(types.SimpleNamespace(no_init=False, iters=a.iters, wide=1.0))
+            _pause(a, "nacelles", snap2)
+        cmd_fairings_fit(types.SimpleNamespace(clear=False, max_count=8, under=1.2))
+        _pause(a, "fairings")
+        run_optimize(PROP_STAGE[1], PROP_STAGE[2], a.iters, "Powell", False, 1.0, skip_fixed=True, commit_now=False)
+        P1 = jload(PARAMS); sync_engine(P1); jsave(PARAMS, P1)
+        commit(P1, "auto phase 2: nacelles and fairings", [])
+    if a.phase in ("finish", "all") and not a.no_finish:
+        print("##### PHASE 3: finish (gear, control surfaces, windows, fine mesh)")
+        P = jload(PARAMS)
+        for k in ("model.has_gear", "model.has_details"):
+            if k in P:
+                P[k]["value"] = 1.0
+        if P["gear.x"]["value"] < 10:
+            print("  note: gear.x is still the default; set it (A300-600: `set gear.x 25.27`, `set gear.track 9.6`, "
+                  "`set gear.wheel_radius 0.63`) and run `auto --phase finish`")
+        _set_tess_scale(max(_get_tess_scale(), 1.6))
+        jsave(PARAMS, P)
+        commit(P, "auto phase 3: gear, details, fine mesh", [])
     cmd_compare(a)
     print("Done.")
 
@@ -1666,31 +2018,57 @@ def cmd_nacelle_fit(a):
     P = jload(PARAMS); sync_engine(P); jsave(PARAMS, P)
 
 def cmd_fairings_fit(a):
-    """Flap-track fairings (the 'points' behind the wing trailing edge): measured from the plan-view residual."""
+    """Flap-track fairings: count, height and lateral position from the FRONT view; x and length from the PLAN view."""
     require_calibration()
+    if a.clear:
+        if FAIR_F.exists():
+            FAIR_F.unlink()
+        print("fairings removed"); return
     P = jload(PARAMS)
+    Q = values(P); Q["_fairings"] = None; Q["model.has_gear"] = 0.0; Q["model.has_details"] = 0.0
     with fast_tess():
-        A = OpenVSPAdapter(); A.build({**values(P), "_fairings": None})
+        A = OpenVSPAdapter(); A.build(Q)
         tris = A.export_stl(HOME / "renders" / "opt.stl")
-    c, bl = residual_blobs(P, "top", tris, 0.10, a.min_area, a.max_area)
-    if not c:
-        sys.exit("calibrate the top view first")
-    x0, x1, y0, y1 = c["bbox"]; row_c = (y0 + y1) / 2.0; ppm = c["ppm"]
-    Pv = values(P); half = Pv["wing.span"] / 2.0
-    def plausible(b):                                          # thin, short, just behind the trailing edge, on the wing
-        xm, ym = (b["bx"] - x0) / ppm, (b["cy"] - row_c) / ppm
-        w_, l_ = b["bh"] / ppm, b["bw"] / ppm
-        xle, ch, _, _ = wing_at(Pv, ym)
-        return 3.0 <= ym <= 0.97 * half and 0.25 <= w_ <= 1.3 and l_ <= 4.5 and abs(xm - (xle + ch)) <= 2.2
-    bl = sorted([b for b in bl if b["cy"] > row_c and plausible(b)], key=lambda b: b["bx"])[: a.max_count]   # +Y wing only
-    items = [{"x": round((b["bx"] - x0) / ppm - a.under, 3), "y": round((b["by"] + b["bh"] / 2.0 - row_c) / ppm, 3),
-              "length": round(b["bw"] / ppm + a.under, 3), "width": round(min(b["bh"] / ppm, 1.6), 3)} for b in bl]
+    cf, fb = residual_blobs(P, "front", tris, 0.06, 0.04, 1.6)
+    ct, tb = residual_blobs(P, "top", tris, 0.06, 0.10, 6.0)
+    if not cf:
+        sys.exit("calibrate the front view first")
+    fx0, fx1, fy0, fy1 = cf["bbox"]; col_c = (fx0 + fx1) / 2.0; fppm = cf["ppm"]
+    zmax = float(tris[:, :, 2].max()); half = Q["wing.span"] / 2.0
+    top_ok = bool(ct)
+    if top_ok:
+        x0, x1, y0, y1 = ct["bbox"]; row_c = (y0 + y1) / 2.0; ppm = ct["ppm"]
+    items = []
+    for q in sorted(fb, key=lambda b: b["cx"]):
+        if q["cx"] <= col_c:
+            continue                                           # right wing only; the model mirrors it
+        y = (q["cx"] - col_c) / fppm
+        w_f, h_f = q["bw"] / fppm, q["bh"] / fppm
+        z_c = zmax - (q["by"] + q["bh"] / 2.0 - fy0) / fppm
+        xle, ch, zc, th = wing_at(Q, y)
+        if not (2.5 <= y <= 0.97 * half) or w_f > 1.4 or h_f > 1.4 or z_c > zc + 0.25:
+            continue                                           # must hang below the wing, away from the fuselage
+        item = {"y": round(y, 3), "z": round(z_c, 3), "height": round(max(h_f, 0.3), 3), "width": round(max(w_f, 0.3), 3),
+                "x": round(xle + ch - 2.0, 3), "length": 2.8}  # fallback when the plan view does not show it
+        if top_ok:
+            cand = [t for t in tb if t["cy"] > row_c and abs((t["cy"] - row_c) / ppm - y) < 1.0
+                    and abs((t["bx"] - x0) / ppm - (xle + ch)) < 3.0]
+            if cand:
+                t = min(cand, key=lambda t: abs((t["cy"] - row_c) / ppm - y))
+                item["x"] = round((t["bx"] - x0) / ppm - a.under, 3)
+                item["length"] = round(t["bw"] / ppm + a.under, 3)
+                item["width"] = round(min(max(t["bh"] / ppm, 0.3), 1.6), 3)
+        items.append(item)
+    items = items[: a.max_count]
     if not items:
-        sys.exit("no fairing-sized blobs found (try --min-area 0.1)")
-    jsave(FAIR_F, {"source": "plan-view residual", "evidence_class": "calculated", "items": items})
+        if FAIR_F.exists():
+            FAIR_F.unlink()
+        sys.exit("no fairing-sized blobs under the wing in the front view (try --clear, or check the engines were restored)")
+    jsave(FAIR_F, {"source": "front view (count, y, z, height) + plan view (x, length)", "evidence_class": "calculated",
+                   "items": items})
     for it in items:
         print("  fairing", it)
-    commit(P, f"{len(items)} track fairings from the plan view", [], reason="flap-track fairings measured from the top mask")
+    commit(P, f"{len(items)} track fairings", [], reason="flap-track fairings from front + plan views")
 
 def cmd_probe_subsurf(a):
     A = OpenVSPAdapter(); v = A.v
@@ -1767,7 +2145,10 @@ def main():
     sp.add_parser("migrate").set_defaults(fn=cmd_migrate)
     s = sp.add_parser("calibrate"); s.add_argument("--view", choices=list(VIEWS), required=True)
     s.add_argument("--image", required=True); s.add_argument("--length", type=float, required=True)
-    s.add_argument("--mask"); s.add_argument("--flip", action="store_true"); s.set_defaults(fn=cmd_calibrate)
+    s.add_argument("--mask"); s.add_argument("--flip", action="store_true")
+    s.add_argument("--keep-parts", action="store_true", help="also keep detached parts near the aircraft (landing-gear wheels)")
+    s.add_argument("--keep-min-area", type=float, default=0.15, help="smallest detached part kept, m2")
+    s.set_defaults(fn=cmd_calibrate)
     s = sp.add_parser("landmarks"); s.add_argument("--view", choices=list(VIEWS), required=True)
     s.add_argument("--image", required=True); s.add_argument("--mask")
     s.add_argument("--flip", action="store_true"); s.set_defaults(fn=cmd_landmarks)
@@ -1775,6 +2156,13 @@ def main():
     s.add_argument("--rect", nargs=4, type=int, action="append", metavar=("X0", "Y0", "X1", "Y1"))
     s.add_argument("--zoom", type=float, default=0.5); s.set_defaults(fn=cmd_erase_mask)
     s = sp.add_parser("auto"); s.add_argument("--passes", type=int, default=2)
+    s.add_argument("--phase", choices=["airframe", "extras", "finish", "all"], default="all")
+    s.add_argument("--refit", action="store_true", help="re-measure the nacelles even if they exist")
+    s.add_argument("--step", action="store_true", help="pause after every step: overlays, then continue / undo / quit")
+    s.add_argument("--masks", action="store_true", help="(re)do the engine/gear mask selection inside auto")
+    s.add_argument("--no-guard", dest="guard", action="store_false", help="do not revert stages that worsen the overall error")
+    s.add_argument("--zoom", type=float, default=0.5, help="display scale of the selection windows")
+    s.add_argument("--no-finish", action="store_true")
     s.add_argument("--iters", type=int, default=80); s.add_argument("--wide", type=float, default=1.75)
     s.add_argument("--stations", type=int, default=31); s.set_defaults(fn=cmd_auto)
     sp.add_parser("build").set_defaults(fn=lambda a: commit(jload(PARAMS), "initial build", []))
@@ -1804,12 +2192,14 @@ def main():
     s.add_argument("--iters", type=int, default=200); s.add_argument("--wide", type=float, default=1.0)
     s.add_argument("--no-init", action="store_true", help="skip the plan-view measurement, only refine")
     s.set_defaults(fn=cmd_nacelle_fit)
+    s = sp.add_parser("masks", help="choose the active mask variant: core (no engines) or extras (with engines)")
+    s.add_argument("--use", choices=["core", "extras"], required=True); s.set_defaults(fn=cmd_masks)
     s = sp.add_parser("restore-mask", help="put the engines back into a mask (inverse of erase-mask)")
     s.add_argument("--view", choices=list(VIEWS), required=True)
     s.add_argument("--rect", nargs=4, type=int, action="append", metavar=("X0", "Y0", "X1", "Y1"))
     s.add_argument("--zoom", type=float, default=0.5); s.set_defaults(fn=cmd_restore_mask)
-    s = sp.add_parser("fairings-fit", help="measure the flap-track fairings from the plan view and add them")
-    s.add_argument("--min-area", type=float, default=0.25); s.add_argument("--max-area", type=float, default=4.0)
+    s = sp.add_parser("fairings-fit", help="flap-track fairings: count/height from the front view, x from the plan view")
+    s.add_argument("--clear", action="store_true", help="remove the fairings from the model")
     s.add_argument("--max-count", type=int, default=8)
     s.add_argument("--under", type=float, default=1.5, help="metres the fairing extends forward under the wing")
     s.set_defaults(fn=cmd_fairings_fit)
@@ -1820,6 +2210,7 @@ def main():
     s = sp.add_parser("rescale", help="fix the scale of a calibrated view without redoing its mask")
     s.add_argument("--view", choices=list(VIEWS), required=True)
     s.add_argument("--length", type=float, required=True); s.set_defaults(fn=cmd_rescale)
+    sp.add_parser("selfcheck", help="compare the fast in-place update with a full rebuild").set_defaults(fn=cmd_selfcheck)
     sp.add_parser("probe").set_defaults(fn=cmd_probe)
     s = sp.add_parser("probe-geom"); s.add_argument("--type", required=True)
     s.add_argument("--all", action="store_true"); s.set_defaults(fn=cmd_probe_geom)
