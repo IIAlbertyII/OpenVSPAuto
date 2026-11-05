@@ -8,3 +8,6 @@
 
 # Mantener este archivo de configuración
 !/.gitignore
+
+# Guía de uso
+!/Guia_aircraft_recon.pdf
