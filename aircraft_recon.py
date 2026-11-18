@@ -261,15 +261,47 @@ def cmd_migrate(a):
         print(f"  + {k} = {P[k]['value']} {P[k]['unit']}")
 
 
+# Changed: where the OpenVSP folder chosen at the prompt is remembered (next to the program; .gitignore keeps it out of git).
+VSP_PATH_FILE = Path(__file__).resolve().parent / "openvsp_path.txt"
+
+def _is_vsp_root(p):
+    # Changed: only real OpenVSP installs count, so an unrelated folder named OpenVSP* (such as this repo) is skipped.
+    return (Path(p) / "python" / "openvsp").is_dir() or (Path(p) / "openvsp").is_dir()
+
 def _vsp_roots(extra=None):
     here = Path(__file__).resolve().parent
     roots = [extra, os.environ.get("VSP_PYTHON")]
-    roots += [str(p) for p in here.glob("OpenVSP*")]
-    # Changed: the author's own folder (~/Documents/<name>/OpenVSPx) was replaced by a generic search,
-    # so the public code holds no personal path. An OpenVSP* folder next to the program's folder is also found.
-    # The program's own folder is skipped, since a clone named OpenVSPAuto also matches OpenVSP*.
-    roots += [str(p) for p in here.parent.glob("OpenVSP*") if p.resolve() != here]
-    return [Path(r) for r in roots if r and Path(r).exists()]
+    # Changed: the folder given at the prompt in an earlier run (see ask_vsp_path).
+    if VSP_PATH_FILE.exists():
+        roots.append(VSP_PATH_FILE.read_text(encoding="utf-8").strip())
+    # Changed: the author's own folder (~/Documents/<name>/OpenVSPx) was replaced by a generic search, so the public
+    # code holds no personal path. OpenVSP* folders are looked for in the program folder, next to it, and in the
+    # usual places a download is unzipped to.
+    auto = [here, here.parent] + [Path.home() / d for d in ("Downloads", "Desktop", "Documents")]
+    for base in auto:
+        if base.is_dir():
+            roots += [str(p) for p in sorted(base.glob("OpenVSP*")) if p.resolve() != here and _is_vsp_root(p)]
+    out = []
+    for r in roots:
+        if r and Path(r).exists() and Path(r).resolve() not in [o.resolve() for o in out]:
+            out.append(Path(r))
+    return out
+
+def ask_vsp_path():
+    """Changed: when OpenVSP is not found, ask for its folder once (interactive consoles only) and remember it."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return None
+    print("OpenVSP was not found. Enter the folder where OpenVSP is unzipped (it contains vsp.exe and a python folder),")
+    print("or press Enter to cancel.")
+    while True:
+        try: ans = input("OpenVSP folder: ").strip().strip('"')
+        except EOFError: return None
+        if not ans: return None
+        if _is_vsp_root(ans):
+            VSP_PATH_FILE.write_text(str(Path(ans).resolve()), encoding="utf-8")
+            print(f"Saved in {VSP_PATH_FILE.name}; it will be used from now on.")
+            return ans
+        print("That folder does not look like OpenVSP (no python\\openvsp inside). Try again.")
 
 def find_pyds(extra=None):
     out = []
@@ -281,16 +313,36 @@ def linked_python_dll(pyd):
     m = set(re.findall(rb"python3\d+\.dll", Path(pyd).read_bytes(), re.I))
     return sorted(x.decode() for x in m)
 
+def _add_vsp_paths(r):
+    # Changed: openvsp_config, utilities and degen_geom are added too. Without them, and unless they were pip-installed,
+    # "import openvsp_config" found the empty project folder python/openvsp_config instead of the package inside it
+    # ("module 'openvsp_config' has no attribute 'LOAD_GRAPHICS'").
+    py = r / "python"
+    for d in [r, py, py / "openvsp", py / "openvsp_config", py / "utilities", py / "degen_geom"]:
+        if d.exists():
+            if str(d) not in sys.path: sys.path.insert(0, str(d))
+    for d in [r, py, py / "openvsp", py / "openvsp" / "openvsp"]:
+        if d.exists() and hasattr(os, "add_dll_directory"):
+            try: os.add_dll_directory(str(d))
+            except OSError: pass
+
 def import_vsp(extra=None):
-    for r in _vsp_roots(extra):
-        for d in [r, r / "python", r / "python" / "openvsp"]:
-            if d.exists():
-                if str(d) not in sys.path: sys.path.insert(0, str(d))
-        for d in [r, r / "python", r / "python" / "openvsp", r / "python" / "openvsp" / "openvsp"]:
-            if d.exists() and hasattr(os, "add_dll_directory"):
-                try: os.add_dll_directory(str(d))
-                except OSError: pass
-    import openvsp as vsp
+    # Changed: reversed, because each folder is inserted at the front of sys.path; this way the first root
+    # (--vsp-path, then VSP_PYTHON, then the saved folder) is the one Python finds first.
+    for r in reversed(_vsp_roots(extra)):
+        _add_vsp_paths(r)
+    try:
+        import openvsp as vsp
+    except ImportError:
+        # Changed: ask for the folder instead of failing straight away; outside a console, say how to give it.
+        ans = ask_vsp_path()
+        if not ans:
+            raise ImportError("OpenVSP not found. Unzip it inside or next to the program folder, set VSP_PYTHON to its "
+                              "folder, or run 'python aircraft_recon.py check-env' in a console to be asked for it.")
+        for m in [m for m in sys.modules if m.split(".")[0] in ("openvsp", "openvsp_config")]:
+            del sys.modules[m]      # drop any half-finished first attempt before retrying
+        _add_vsp_paths(Path(ans))
+        import openvsp as vsp
     return vsp
 
 def cmd_check_env(a):

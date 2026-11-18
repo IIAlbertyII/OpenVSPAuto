@@ -16,14 +16,14 @@ You need Windows, Git and Python 3.13, because the OpenVSP Python binding is bui
    git clone https://github.com/IIAlbertyII/OpenVSPAuto.git
    cd OpenVSPAuto
    ```
-2. Download OpenVSP for Windows from [openvsp.org/download.php](https://openvsp.org/download.php) and unzip it inside `OpenVSPAuto`, in a folder whose name starts with `OpenVSP` (for example `OpenVSPAuto\OpenVSP-3.53.1-win64`). The program was tested with 3.53.1. A folder next to `OpenVSPAuto` is also found; anywhere else, set the `VSP_PYTHON` variable to the OpenVSP folder.
+2. Download OpenVSP for Windows (the Python 3.13 build) from [openvsp.org/download.php](https://openvsp.org/download.php) and unzip it. The program was tested with 3.53.1. It finds OpenVSP by itself in a folder whose name starts with `OpenVSP` inside `OpenVSPAuto`, next to it, or in your Downloads, Desktop or Documents folder. If OpenVSP is anywhere else, the program asks for its folder the first time and remembers it in `openvsp_path.txt`; you can also set the `VSP_PYTHON` variable to that folder.
 3. Create the environment with Python 3.13 and install the dependencies:
    ```
    py -3.13 -m venv .venv
    .venv\Scripts\activate
-   pip install numpy opencv-python scipy
+   pip install numpy opencv-python scipy six
    ```
-   With `uv`, the first line is `uv venv --python 3.13 .venv`. In each new session, only the `activate` line is needed.
+   `six` is needed by the Python packages that come with OpenVSP; those packages are loaded from the OpenVSP folder, so they do not need installing. With `uv`, the first line is `uv venv --python 3.13 .venv`. In each new session, only the `activate` line is needed.
 4. Check that everything works:
    ```
    python aircraft_recon.py selftest      # must end with SELFTEST OK
@@ -40,9 +40,10 @@ README.md                  this document
 aircraft_recon_guide.pdf   step-by-step guide
 ```
 
-OpenVSP, your models and your drawings are not part of the repository. The program creates these folders as you use it:
+OpenVSP, your models and your drawings are not part of the repository. The program creates these files and folders as you use it:
 
 ```
+openvsp_path.txt           OpenVSP folder you gave when asked (section 1)
 aircraft/
   current.txt              selected project
   <NAME>/                  one folder per aircraft (section 3)
@@ -161,7 +162,7 @@ Technical note: each section needs its own driver group (`SetDriverGroup`) and a
 
 Useful parameters: `model.has_propulsion`, `model.has_gear`, `model.has_details`, `gear.x`, `gear.nose_x`, `gear.track`, `gear.wheel_radius`, `gear.height_ref`, `gear.door_angle`, `window.count`, `window.x0`, `window.x1`, `window.w_side`.
 
-Environment variables: `AIRCRAFT_PROJECT`, `AIRCRAFT_NO_SESSION=1` (forces full rebuilds), `AIRCRAFT_VERBOSE=1`, `AIRCRAFT_WING_SEGMENTS=1`, `VSP_PYTHON`.
+Environment variables: `AIRCRAFT_PROJECT`, `AIRCRAFT_NO_SESSION=1` (forces full rebuilds), `AIRCRAFT_VERBOSE=1`, `AIRCRAFT_WING_SEGMENTS=1`, `VSP_PYTHON` (OpenVSP folder; takes priority over the automatic search). `check-env --vsp-path FOLDER` tests a given OpenVSP folder.
 
 ## 7. Model components
 
