@@ -1,13 +1,13 @@
 
-# Ignorar todo por defecto
+# Ignore everything by default
 /*
 
-# Permitir archivos Python y Markdown en la raíz
+# Allow Python and Markdown files in the root
 !/*.py
 !/*.md
 
-# Mantener este archivo de configuración
+# Keep this file
 !/.gitignore
 
-# Guía de uso
-!/Guia_aircraft_recon.pdf
+# User guide
+!/aircraft_recon_guide.pdf

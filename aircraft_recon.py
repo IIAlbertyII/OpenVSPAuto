@@ -265,7 +265,10 @@ def _vsp_roots(extra=None):
     here = Path(__file__).resolve().parent
     roots = [extra, os.environ.get("VSP_PYTHON")]
     roots += [str(p) for p in here.glob("OpenVSP*")]
-    roots += [str(Path.home() / "Documents" / "diseño" / "OpenVSPx")]
+    # Changed: the author's own folder (~/Documents/<name>/OpenVSPx) was replaced by a generic search,
+    # so the public code holds no personal path. An OpenVSP* folder next to the program's folder is also found.
+    # The program's own folder is skipped, since a clone named OpenVSPAuto also matches OpenVSP*.
+    roots += [str(p) for p in here.parent.glob("OpenVSP*") if p.resolve() != here]
     return [Path(r) for r in roots if r and Path(r).exists()]
 
 def find_pyds(extra=None):
