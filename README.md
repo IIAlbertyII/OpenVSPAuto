@@ -7,6 +7,8 @@
 
 > AI interprets; deterministic software measures and executes.
 
+**License:** [PolyForm Noncommercial 1.0.0](LICENSE.md). You may use, share and modify the program for any noncommercial purpose, including personal projects, study, research and use by universities or other noncommercial organisations. Commercial use, such as selling it or using it in paid work or products, needs the author's written permission: open an [issue](https://github.com/IIAlbertyII/OpenVSPAuto/issues) to ask.
+
 ## 1. Installation
 
 You need Windows, Git and Python 3.13, because the OpenVSP Python binding is built for that version.
@@ -38,6 +40,7 @@ Keep the program and its temporary files in paths without accents or other non-A
 aircraft_recon.py          the program
 README.md                  this document
 aircraft_recon_guide.pdf   step-by-step guide
+LICENSE.md                 license (PolyForm Noncommercial 1.0.0)
 ```
 
 OpenVSP, your models and your drawings are not part of the repository. The program creates these files and folders as you use it:

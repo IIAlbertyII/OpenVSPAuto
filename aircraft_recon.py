@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
+# Changed: licence notice, so the terms travel with copies of this file (see LICENSE.md).
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Required Notice: Copyright 2026 Alberto Torres Palomo (https://github.com/IIAlbertyII/OpenVSPAuto)
+# Free to use, share and modify for noncommercial purposes. Commercial use needs the author's permission.
 """
 aircraft_recon.py - core reconstruction loop (single text file, pip-only deps)
 
-pip install numpy opencv-python scipy
+pip install numpy opencv-python scipy six    (six: needed by the Python packages that come with OpenVSP)
 
 Commands:
   selftest | check-env | check-var-comp | init | migrate
